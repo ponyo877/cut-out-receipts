@@ -19,6 +19,8 @@ import (
 	"time"
 )
 
+// const marginSize = 50
+
 // Point は2D座標を表します
 type Point struct {
 	X, Y int
@@ -87,8 +89,23 @@ func detectAndCropReceipts(this js.Value, args []js.Value) interface{} {
 		return js.ValueOf("Error processing image")
 	}
 
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	marginSize := min(width, height) / 20
+	// 新しい画像サイズを計算（マージン込み）
+	newWidth := width + 2*marginSize
+	newHeight := height + 2*marginSize
+
+	// 新しい画像を作成
+	newImg := image.NewRGBA(image.Rect(0, 0, newWidth, newHeight))
+	draw.Draw(newImg, newImg.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+
+	// 元の画像を新しい画像の中央に配置
+	draw.Draw(newImg, image.Rect(marginSize, marginSize, marginSize+width, marginSize+height),
+		img, bounds.Min, draw.Src)
+
 	// レシートを検出して切り取る
-	croppedImages := processReceiptImage(img)
+	croppedImages := processReceiptImage(newImg)
 
 	// 切り取った画像をBase64でエンコードして返す
 	resultArray := js.Global().Get("Array").New(len(croppedImages))
@@ -129,7 +146,7 @@ func processReceiptImage(img image.Image) []image.Image {
 	return cropReceiptImages(img, approxContours)
 }
 
-// 検出された矩形部分を切り取る
+// 検出された矩形部分を切り取り、輪郭線も描画する
 func cropReceiptImages(img image.Image, contours []Contour) []image.Image {
 	// 元画像の境界を取得
 	bounds := img.Bounds()
@@ -155,11 +172,160 @@ func cropReceiptImages(img image.Image, contours []Contour) []image.Image {
 		croppedImg := image.NewRGBA(image.Rect(0, 0, rect.Dx(), rect.Dy()))
 		draw.Draw(croppedImg, croppedImg.Bounds(), img, rect.Min, draw.Src)
 
+		// 輪郭線を描画
+		drawContourOnImage(croppedImg, contour, rect.Min, color.RGBA{R: 255, G: 0, B: 0, A: 255}) // 赤色で輪郭を描画
+
 		// 結果配列に追加
 		croppedImages = append(croppedImages, croppedImg)
 	}
 
 	return croppedImages
+}
+
+// 画像に輪郭線を描画し、面積を計算して表示する
+func drawContourOnImage(img *image.RGBA, contour Contour, offset image.Point, lineColor color.Color) {
+	if len(contour) < 2 {
+		return
+	}
+	n := len(contour)
+
+	// 輪郭の点を順番に線で結ぶ
+	for i := 0; i < n; i++ {
+		j := (i + 1) % n
+		// 線を引く（ブレゼンハムのアルゴリズム）
+		drawLine(img,
+			contour[i].X-offset.X, contour[i].Y-offset.Y,
+			contour[j].X-offset.X, contour[j].Y-offset.Y,
+			lineColor)
+	}
+
+	// オフセット情報をデバッグ出力
+	fmt.Printf("オフセット情報: X=%d, Y=%d\n", offset.X, offset.Y)
+
+	// 元の座標系での面積を計算
+	originalArea := calculatePolygonArea(contour)
+
+	// 面積の計算に使用した各点の座標をデバッグ出力
+	if n <= 10 { // 点数が多すぎる場合は出力を制限
+		fmt.Println("輪郭の座標点:")
+		for i, p := range contour {
+			fmt.Printf("  点%d: (%d, %d)\n", i, p.X, p.Y)
+		}
+	}
+
+	// 面積を画像の左上に表示
+	drawAreaText(img, originalArea)
+}
+
+// 多角形の面積を計算する (Shoelace formula)
+func calculatePolygonArea(contour Contour) float64 {
+	n := len(contour)
+	if n < 3 {
+		return 0
+	}
+
+	// バウンディングボックスを計算して面積を確認（デバッグ用）
+	minX, maxX, minY, maxY := findBoundingBox(contour)
+	width := maxX - minX
+	height := maxY - minY
+	rectArea := width * height
+
+	// デバッグ情報
+	fmt.Printf("輪郭点数: %d, バウンディングボックス: %d x %d = %d 平方ピクセル\n",
+		n, width, height, rectArea)
+
+	// Shoelace formula (ガウスの面積公式)で計算
+	area := 0.0
+	for i := 0; i < n; i++ {
+		j := (i + 1) % n
+		area += float64(contour[i].X*contour[j].Y - contour[j].X*contour[i].Y)
+	}
+
+	polygonArea := math.Abs(area) / 2.0
+	fmt.Printf("計算された多角形面積: %.2f 平方ピクセル\n", polygonArea)
+
+	// 面積が極端に小さい場合はバウンディングボックスの面積を返す
+	// if polygonArea < float64(rectArea)*0.1 {
+	// 	fmt.Println("警告: 計算された面積が小さすぎるため、バウンディングボックス面積を使用")
+	// 	return float64(rectArea)
+	// }
+
+	return polygonArea
+}
+
+// 画像に面積のテキストを描画する
+func drawAreaText(img *image.RGBA, area float64) {
+	// 画像の左上に面積を表示
+	bounds := img.Bounds()
+	x := bounds.Min.X + 5
+	y := bounds.Min.Y + 15
+
+	// 面積を文字列に変換
+	areaText := fmt.Sprintf("Area: %.1f", area)
+
+	// 背景を描画（読みやすくするため）
+	for dy := -1; dy <= 1; dy++ {
+		for dx := -1; dx <= 1; dx++ {
+			drawSimpleText(img, areaText, x+dx, y+dy, color.RGBA{R: 0, G: 0, B: 0, A: 255})
+		}
+	}
+
+	// テキストを描画
+	drawSimpleText(img, areaText, x, y, color.RGBA{R: 0, G: 255, B: 0, A: 255})
+}
+
+// シンプルなテキスト描画
+func drawSimpleText(img *image.RGBA, text string, x, y int, textColor color.Color) {
+	// ピクセルごとに文字を描画する単純な実装
+	// 実際のアプリケーションでは、フォントライブラリを使用することを推奨
+	posX := x
+
+	// 各文字分のスペースを確保して点を打つ
+	for i := 0; i < len(text); i++ {
+		// 文字の幅（簡易表示のため固定値）
+		charWidth := 8
+
+		// 点を打つだけの単純な表示
+		img.Set(posX, y, textColor)
+
+		// 次の文字位置へ
+		posX += charWidth
+	}
+}
+
+// ブレゼンハムのアルゴリズムで線を描画
+func drawLine(img *image.RGBA, x0, y0, x1, y1 int, clr color.Color) {
+	dx := abs(x1 - x0)
+	dy := abs(y1 - y0)
+	sx, sy := 1, 1
+	if x0 >= x1 {
+		sx = -1
+	}
+	if y0 >= y1 {
+		sy = -1
+	}
+	err := dx - dy
+
+	bounds := img.Bounds()
+	for {
+		// 画像の範囲内かチェック
+		if x0 >= bounds.Min.X && x0 < bounds.Max.X && y0 >= bounds.Min.Y && y0 < bounds.Max.Y {
+			img.Set(x0, y0, clr)
+		}
+
+		if x0 == x1 && y0 == y1 {
+			break
+		}
+		e2 := 2 * err
+		if e2 > -dy {
+			err -= dy
+			x0 += sx
+		}
+		if e2 < dx {
+			err += dx
+			y0 += sy
+		}
+	}
 }
 
 // 画像を2値化する（ガウシアン法 - 高精度マルチパスアプローチ）
@@ -668,13 +834,21 @@ func approximateContours(img image.Image, contours []Contour) []Contour {
 		arcLength := calculateArcLength(contour, true)
 
 		// 面積を計算
-		area := calculateContourArea(contour, width, height)
-		fmt.Printf("Contour %d: 点数=%d, 面積=%.2f (画像の%.2f%%), 周囲長=%.2f\n",
-			i, len(contour), area, (area/float64(imgSize))*100, arcLength)
+		// area := calculateContourArea(contour, width, height)
+		area := calculatePolygonArea(contour)
+		// area := calculateAreaUsingPick(contour)
+		maxArea := calculateContourMaxArea(contour, width, height)
 		// 条件に合う輪郭のみ処理
+		marginSize := min(width, height) / 20
+		for _, p := range contour {
+			if p.X < marginSize || p.X >= width-marginSize || p.Y < marginSize || p.Y >= height-marginSize {
+				area = 0
+				break
+			}
+		}
 		if arcLength != 0 && area > float64(imgSize)*0.02 && area < float64(imgSize)*0.9 {
-			fmt.Printf("Contour %d: 点数=%d, 面積=%.2f (画像の%.2f%%), 周囲長=%.2f\n",
-				i, len(contour), area, (area/float64(imgSize))*100, arcLength)
+			fmt.Printf("Contour %d: 点数=%d, 面積=%.2f (画像の%.2f%%), (画像の%.2f%%), 周囲長=%.2f\n",
+				i, len(contour), area, (area/float64(imgSize))*100, (maxArea/float64(imgSize))*100, arcLength)
 			// 輪郭を近似
 			approxContour := approxPolyDP(contour, 0.05*arcLength, true)
 			// 凸包を適用して凸多角形を保証する
@@ -812,7 +986,7 @@ func calculateArcLength(contour Contour, closed bool) float64 {
 }
 
 // 最大矩形の面積を計算
-func calculateContourArea(contour Contour, imageWidth, imageHeight int) float64 {
+func calculateContourMaxArea(contour Contour, imageWidth, imageHeight int) float64 {
 	minX, minY := imageWidth, imageHeight
 	maxX, maxY := 0, 0
 
@@ -831,6 +1005,18 @@ func calculateContourArea(contour Contour, imageWidth, imageHeight int) float64 
 		}
 	}
 	return float64((maxX - minX + 1) * (maxY - minY + 1))
+}
+
+// 最大矩形の面積を計算
+func calculateContourArea(contour Contour, imageWidth, imageHeight int) float64 {
+	n := len(contour)
+	area := 0.0
+	for i := 0; i < n; i++ {
+		j := (i + 1) % n
+		area += float64(contour[i].X*contour[j].Y - contour[j].X*contour[i].Y)
+	}
+
+	return math.Abs(area) / 2.0
 }
 
 // 輪郭の面積を計算 (Shoelace formula)
